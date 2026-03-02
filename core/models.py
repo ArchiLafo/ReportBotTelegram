@@ -57,19 +57,8 @@ class ObjectStatus(models.TextChoices):
     CLOSED = 'closed', 'Закрыт'
 
 
-class ObjectType(models.TextChoices):
-    PRIVATE = 'private', 'Частный'
-    FEDERAL = 'federal', 'Федеральный'
-
-
 class OrgObject(models.Model):
     name = models.CharField(max_length=255, verbose_name='Название объекта')
-    object_type = models.CharField(
-        max_length=20,
-        choices=ObjectType.choices,
-        default=ObjectType.PRIVATE,
-        verbose_name='Тип объекта'
-    )
     passport_json = models.JSONField(default=dict, blank=True, verbose_name='Паспорт (JSON)')
     status = models.CharField(
         max_length=20,
@@ -98,15 +87,14 @@ class OrgObject(models.Model):
 class WellStage(models.TextChoices):
     DRILLING = 'drilling', 'Бурение'
     PUMPING = 'pumping', 'ОФР'
-    MAINTENANCE = 'maintenance', 'Сопровождение'
+    MODE = 'mode', 'Режим'   
     LIQUIDATION = 'liquidation', 'Ликвидация'
     COMPLETED = 'completed', 'Завершена'
-    FORCE_MAJEURE = 'force_majeure', 'Форс-мажор'  # новый статус для заморозки
 
 
 class WellStatus(models.TextChoices):
     ACTIVE = 'active', 'Активна'
-    CLOSING_PENDING = 'closing_pending', 'Ожидает подтверждения закрытия'
+    CLOSING_PENDING = 'closing_pending', 'Ожидает подтверждения закрытия'  
     CLOSED = 'closed', 'Закрыта'
 
 
@@ -116,10 +104,6 @@ class Well(models.Model):
         on_delete=models.CASCADE,
         related_name='wells',
         verbose_name='Объект'
-    )
-    maintenance_needed = models.BooleanField(
-        default=False,
-        verbose_name='Требуется сопровождение'
     )
     previous_stage = models.CharField(
         max_length=20,
@@ -131,7 +115,6 @@ class Well(models.Model):
     name = models.CharField(max_length=100, verbose_name='Номер/название скважины')
     planned_depth_m = models.FloatField(null=True, blank=True, verbose_name='Плановая глубина (м)')
     current_depth_m = models.FloatField(null=True, blank=True, verbose_name='Текущая глубина (м)')
-    # Поля для этапов
     stage = models.CharField(
         max_length=20,
         choices=WellStage.choices,
@@ -141,11 +124,15 @@ class Well(models.Model):
     planned_pumping_hours = models.FloatField(null=True, blank=True, verbose_name='Плановая длительность ОФР (часы)')
     pumping_started_at = models.DateTimeField(null=True, blank=True, verbose_name='Начало ОФР')
     pumping_completed_at = models.DateTimeField(null=True, blank=True, verbose_name='Завершение ОФР')
-    maintenance_started_at = models.DateTimeField(null=True, blank=True, verbose_name='Начало сопровождения')
-    maintenance_completed_at = models.DateTimeField(null=True, blank=True, verbose_name='Завершение сопровождения')
+    mode_started_at = models.DateTimeField(null=True, blank=True, verbose_name='Начало режима')
+    mode_completed_at = models.DateTimeField(null=True, blank=True, verbose_name='Завершение режима')
     liquidation_completed_at = models.DateTimeField(null=True, blank=True, verbose_name='Дата ликвидации')
     total_pumping_hours = models.FloatField(default=0.0, verbose_name='Накоплено часов ОФР')
-    # Существующие поля
+    total_discharge_hours = models.FloatField(default=0.0, verbose_name='Накоплено часов откачки')
+    total_drilling_pumping_hours = models.FloatField(default=0.0, verbose_name='Часы прокачки при бурении')
+    planned_mode_count = models.IntegerField(default=0, verbose_name='Плановое количество режимов')
+    remaining_mode_count = models.IntegerField(default=0, verbose_name='Осталось режимов')
+    closed_reason = models.CharField(max_length=50, blank=True, null=True, verbose_name='Причина закрытия')
     status = models.CharField(
         max_length=30,
         choices=WellStatus.choices,

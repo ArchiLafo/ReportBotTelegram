@@ -11,25 +11,26 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command as AiogramCommand
 from aiogram.filters import CommandStart
-from aiogram.types import Message, ChatMemberUpdated, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, ChatMemberUpdated, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from core.models import (
     TgUser, TgRole, KnownChat, KnownChatType,
-    OrgObject, Well, WellStatus, ObjectStatus, ObjectType,
+    OrgObject, Well, WellStatus, ObjectStatus,
     Form, FormField, Report, CloseRequest, CloseRequestStatus,
     WellStage
 )
 
 logger = logging.getLogger(__name__)
 
-
 # --------------------- Состояния FSM ---------------------
 class CreateObjectStates(StatesGroup):
     waiting_for_name = State()
-    waiting_for_type = State()
     waiting_for_chat = State()
     waiting_for_wells = State()
 
@@ -40,15 +41,16 @@ class ReportStates(StatesGroup):
     choosing_stage = State()
     choosing_well = State()
     entering_fields = State()
-    asking_force_majeure = State()
-    waiting_temperature = State() 
+    asking_accident = State()
+    accident_handling = State()
+    confirm_send = State()
+    sending_files = State()      
+    waiting_temperature = State()
 
 
-class UnfreezeStates(StatesGroup):
-    choosing_well = State()
-
-
-# --------------------- Вспомогательные функции для работы с БД ---------------------
+# ------------------------------------------------------------
+#  Вспомогательные функции для работы с БД
+# ------------------------------------------------------------
 @sync_to_async
 def get_or_create_user(tg_user_id: int, full_name: str) -> TgUser:
     user, created = TgUser.objects.get_or_create(
@@ -104,7 +106,7 @@ async def check_user_role(message: Message, allowed_roles: list) -> bool:
 @sync_to_async
 def get_active_objects():
     from django.db.models import Exists, OuterRef
-    active_wells = Well.objects.filter(object=OuterRef('pk'), status=WellStatus.ACTIVE).exclude(stage=WellStage.FORCE_MAJEURE)
+    active_wells = Well.objects.filter(object=OuterRef('pk'), status=WellStatus.ACTIVE)
     return list(OrgObject.objects.filter(status=ObjectStatus.ACTIVE).annotate(
         has_active_wells=Exists(active_wells)
     ).filter(has_active_wells=True).order_by('name'))
@@ -112,12 +114,10 @@ def get_active_objects():
 
 @sync_to_async
 def get_stages_with_wells(object_id):
-    """Возвращает уникальные этапы, на которых есть активные (не замороженные) скважины для данного объекта."""
     stages = Well.objects.filter(
         object_id=object_id,
         status=WellStatus.ACTIVE
-    ).exclude(stage=WellStage.FORCE_MAJEURE).values_list('stage', flat=True)
-    # Принудительно убираем дубликаты через set
+    ).values_list('stage', flat=True)
     unique_stages = list(set(stages))
     return unique_stages
 
@@ -140,14 +140,25 @@ def get_form_fields(form_code: str):
         return []
 
 
-def compose_report_text(report_date, author_name, well_name, answers, fields, force_majeure=False):
+def compose_report_text(report_date, author_name, well_name, answers, fields, accident_data=None):
     lines = []
     lines.append(f"{report_date.strftime('%d.%m.%Y')} — {author_name}")
     lines.append(f"Скважина: {well_name}")
-    if force_majeure:
-        lines.append("⚠️ ФОРС-МАЖОР")
+
+    if accident_data and accident_data.get('occurred'):
+        if accident_data['type'] == 'repairable':
+            lines.append("⚠️ Аварийная ситуация (устраняется)")
+        elif accident_data['type'] == 'fatal':
+            lines.append("❌ Аварийная ситуация (скважина закрыта)")
+        elif accident_data['type'] == 'technical':
+            lines.append("⚠️ Техническая авария (время обнулено)")
+        elif accident_data['type'] == 'successful':
+            lines.append("⚠️ Результативная авария (этап завершён досрочно)")
+        else:
+            lines.append("⚠️ Аварийная ситуация")
     else:
-        lines.append("✅ Сегодня без форс-мажоров")
+        lines.append("✅ Без аварий")
+
     if fields:
         lines.append("")
         for f in fields:
@@ -157,6 +168,7 @@ def compose_report_text(report_date, author_name, well_name, answers, fields, fo
             if f.type == 'checkbox':
                 val = 'Да' if val else 'Нет'
             lines.append(f"{f.label}: {val}")
+
     return "\n".join(lines).strip()
 
 
@@ -167,15 +179,18 @@ async def transition_well_stage(well, new_stage, bot=None):
 
     if new_stage == WellStage.PUMPING:
         well.pumping_started_at = now
-    elif new_stage == WellStage.MAINTENANCE:
-        well.maintenance_started_at = now
+    elif new_stage == WellStage.MODE:
+        well.mode_started_at = now
     elif new_stage == WellStage.LIQUIDATION:
         pass
     elif new_stage == WellStage.COMPLETED:
         well.closed_at = now
         well.status = WellStatus.CLOSED
+        well.closed_reason = 'completed'
 
-    await sync_to_async(well.save)(update_fields=['stage', 'pumping_started_at', 'maintenance_started_at', 'closed_at', 'status'])
+    await sync_to_async(well.save)(update_fields=[
+        'stage', 'pumping_started_at', 'mode_started_at', 'closed_at', 'status', 'closed_reason'
+    ])
 
     if bot and well.object and well.object.chat:
         text = f"🔁 Скважина {well.name} перешла с этапа «{WellStage(old_stage).label}» на этап «{WellStage(new_stage).label}»."
@@ -210,8 +225,6 @@ async def cmd_help(message: Message) -> None:
         "/cancel - отменить текущее действие\n"
         "/report - создать ежедневную сводку\n"
         "/create_object - создать новый объект (админ/разработчик)\n"
-        "/unfreeze - разморозить скважину (админ/разработчик)\n"
-        "(другие команды в разработке)"
     )
     await message.answer(text)
 
@@ -240,20 +253,6 @@ async def process_object_name(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(object_name=name)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Частный", callback_data="private"),
-         InlineKeyboardButton(text="Федеральный", callback_data="federal")]
-    ])
-    await message.answer("Выберите тип объекта:", reply_markup=kb)
-    await state.set_state(CreateObjectStates.waiting_for_type)
-
-
-async def process_object_type(callback: CallbackQuery, state: FSMContext) -> None:
-    obj_type = callback.data
-    await state.update_data(object_type=obj_type)
-
-    await callback.message.edit_text(f"Тип объекта: {'Частный' if obj_type=='private' else 'Федеральный'}")
-
     chats = await sync_to_async(list)(
         KnownChat.objects.filter(is_active=True, bound_object__isnull=True)
     )
@@ -261,7 +260,7 @@ async def process_object_type(callback: CallbackQuery, state: FSMContext) -> Non
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⏭ Пропустить (привязать позже)", callback_data="skip_chat")]
         ])
-        await callback.message.answer(
+        await message.answer(
             "Нет доступных чатов для привязки. Вы можете привязать объект к чату позже.",
             reply_markup=kb
         )
@@ -275,7 +274,7 @@ async def process_object_type(callback: CallbackQuery, state: FSMContext) -> Non
     buttons.append([InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip_chat")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.answer("Выберите чат для привязки объекта или пропустите:", reply_markup=kb)
+    await message.answer("Выберите чат для привязки объекта или пропустите:", reply_markup=kb)
     await state.set_state(CreateObjectStates.waiting_for_chat)
 
 
@@ -297,8 +296,8 @@ async def process_chat_choice(callback: CallbackQuery, state: FSMContext) -> Non
 
     await callback.message.answer(
         "Введите данные скважины одной строкой:\n"
-        "<b>Название Глубина [Часы_ОФР] [Сопровождение(да/нет)]</b>\n"
-        "Пример: Скв-1 150 24 да\n"
+        "<b>Название Глубина [Часы_ОФР] [Количество_режимов]</b>\n"
+        "Пример: Скв-1 150 24 3\n"
         "Для завершения введите /done"
     )
     await state.set_state(CreateObjectStates.waiting_for_wells)
@@ -318,7 +317,7 @@ async def process_well(message: Message, state: FSMContext) -> None:
         return
 
     pumping_hours = None
-    maintenance_needed = False
+    mode_count = 0
     if len(parts) >= 3:
         try:
             pumping_hours = float(parts[2].replace(',', '.'))
@@ -326,7 +325,11 @@ async def process_well(message: Message, state: FSMContext) -> None:
             await message.answer("Часы ОФР должны быть числом.")
             return
     if len(parts) >= 4:
-        maintenance_needed = parts[3].lower() in ['да', 'yes', '1']
+        try:
+            mode_count = int(parts[3])
+        except ValueError:
+            await message.answer("Количество режимов должно быть целым числом.")
+            return
 
     data = await state.get_data()
     wells = data.get('wells', [])
@@ -334,7 +337,7 @@ async def process_well(message: Message, state: FSMContext) -> None:
         'name': name,
         'depth': depth,
         'pumping_hours': pumping_hours,
-        'maintenance_needed': maintenance_needed
+        'mode_count': mode_count,
     })
     await state.update_data(wells=wells)
 
@@ -347,23 +350,18 @@ async def process_well(message: Message, state: FSMContext) -> None:
 async def finish_wells(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     object_name = data.get('object_name')
-    object_type = data.get('object_type', ObjectType.PRIVATE)
+    obj = await sync_to_async(OrgObject.objects.create)(
+        name=object_name,
+        status=ObjectStatus.ACTIVE
+    )
     chat_id = data.get('chat_id')
     wells_data = data.get('wells', [])
 
-    obj = await sync_to_async(OrgObject.objects.create)(
-        name=object_name,
-        object_type=object_type,
-        status=ObjectStatus.ACTIVE
-    )
-
     if chat_id:
-        # Проверяем, не привязан ли уже этот чат к другому объекту
         existing_obj = await sync_to_async(OrgObject.objects.filter(chat_id=chat_id).first)()
         if existing_obj:
             await message.answer("⚠️ Внимание: выбранный чат уже привязан к другому объекту. Объект создан без привязки к чату.")
         else:
-            # Привязываем чат
             chat = await sync_to_async(KnownChat.objects.get)(chat_id=chat_id)
             obj.chat = chat
             await sync_to_async(obj.save)(update_fields=['chat'])
@@ -374,7 +372,11 @@ async def finish_wells(message: Message, state: FSMContext) -> None:
             name=w['name'],
             planned_depth_m=w['depth'],
             planned_pumping_hours=w['pumping_hours'],
-            maintenance_needed=w['maintenance_needed'],
+            planned_mode_count=w['mode_count'],
+            remaining_mode_count=w['mode_count'],
+            total_pumping_hours=0.0,
+            total_discharge_hours=0.0,
+            total_drilling_pumping_hours=0.0,
             status=WellStatus.ACTIVE,
             stage=WellStage.DRILLING
         )
@@ -394,9 +396,9 @@ async def cmd_report(message: Message, state: FSMContext) -> None:
     await message.answer("Выберите тип сводки:", reply_markup=kb)
     await state.set_state(ReportStates.choosing_report_type)
 
+
 async def process_report_type(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.data == "report_type_work":
-        # Переходим к выбору объекта (существующая логика)
         objects = await get_active_objects()
         if not objects:
             await callback.message.edit_text("Нет доступных объектов для отчёта.")
@@ -410,7 +412,6 @@ async def process_report_type(callback: CallbackQuery, state: FSMContext) -> Non
         await callback.message.edit_text("Выберите объект:", reply_markup=kb)
         await state.set_state(ReportStates.choosing_object)
     elif callback.data == "report_type_temp":
-        # Для температуры сначала выбираем объект
         objects = await get_active_objects()
         if not objects:
             await callback.message.edit_text("Нет доступных объектов для отчёта.")
@@ -422,7 +423,8 @@ async def process_report_type(callback: CallbackQuery, state: FSMContext) -> Non
             for obj in objects
         ])
         await callback.message.edit_text("Выберите объект для температурной сводки:", reply_markup=kb)
-        await state.set_state(ReportStates.choosing_object)  # используем то же состояние, но данные отметим позже
+        await state.set_state(ReportStates.choosing_object)
+
 
 async def process_report_object(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.data.startswith("rep_obj_"):
@@ -434,7 +436,6 @@ async def process_report_object(callback: CallbackQuery, state: FSMContext) -> N
         await state.clear()
         return
     await state.update_data(selected_object_id=obj_id)
-    # Строим кнопки этапов
     buttons = []
     for stage in stages:
         label = WellStage(stage).label
@@ -443,6 +444,7 @@ async def process_report_object(callback: CallbackQuery, state: FSMContext) -> N
     await callback.message.edit_text("Выберите этап:", reply_markup=kb)
     await state.set_state(ReportStates.choosing_stage)
 
+
 async def process_temp_object(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.data.startswith("temp_obj_"):
         return
@@ -450,6 +452,7 @@ async def process_temp_object(callback: CallbackQuery, state: FSMContext) -> Non
     await state.update_data(selected_object_id=obj_id, report_type='temperature')
     await callback.message.edit_text("Введите температуру (например: -5.5 или 10):")
     await state.set_state(ReportStates.waiting_temperature)
+
 
 async def handle_temperature(message: Message, state: FSMContext) -> None:
     try:
@@ -464,7 +467,6 @@ async def handle_temperature(message: Message, state: FSMContext) -> None:
     user = await sync_to_async(TgUser.objects.get)(tg_user_id=message.from_user.id)
     report_date = timezone.localdate()
 
-    # Формируем текст
     text = (
         f"{report_date.strftime('%d.%m.%Y')} — {user.full_name or user.tg_user_id}\n"
         f"Температура на объекте {obj.name} {temp}°C"
@@ -476,7 +478,7 @@ async def handle_temperature(message: Message, state: FSMContext) -> None:
         payload_json={'temperature': temp},
         report_date=report_date,
         message_text=text,
-        stage=None,  # для температуры этап не указываем
+        stage=None,
     )
 
     if obj.chat:
@@ -493,6 +495,7 @@ async def handle_temperature(message: Message, state: FSMContext) -> None:
 
     await message.answer("✅ Температурная сводка отправлена.")
     await state.clear()
+
 
 async def process_report_stage(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.data.startswith("rep_stage_"):
@@ -521,17 +524,18 @@ async def process_report_well(callback: CallbackQuery, state: FSMContext) -> Non
     await state.update_data(selected_well_id=well_id)
 
     data = await state.get_data()
-    stage = data['selected_stage']          # получаем этап из данных
+    stage = data['selected_stage']
 
-    # Сохраняем текущую глубину, если этап бурения
+    # Получаем скважину для сохранения текущих данных
+    well = await sync_to_async(Well.objects.get)(id=well_id)
     if stage == WellStage.DRILLING:
-        well = await sync_to_async(Well.objects.get)(id=well_id)
         await state.update_data(current_depth=well.current_depth_m)
 
+    # Определяем код формы
     form_code_map = {
         WellStage.DRILLING: 'drilling_daily',
         WellStage.PUMPING: 'pumping_daily',
-        WellStage.MAINTENANCE: 'maintenance_daily',
+        WellStage.MODE: 'mode_daily',
         WellStage.LIQUIDATION: 'liquidation_daily',
     }
     form_code = form_code_map.get(stage)
@@ -542,8 +546,8 @@ async def process_report_well(callback: CallbackQuery, state: FSMContext) -> Non
 
     fields = await get_form_fields(form_code)
     if not fields:
-        # Если полей нет, сразу переходим к вопросу о форс-мажоре
-        await ask_force_majeure(callback.message, state)
+        # Если полей нет, сразу переходим к вопросу об аварии
+        await ask_accident(callback.message, state)
         await callback.message.delete()
         return
     await state.update_data(form_fields=fields, current_field_index=0, answers={})
@@ -556,12 +560,11 @@ async def ask_next_field(message: Message, state: FSMContext) -> None:
     fields = data['form_fields']
     idx = data['current_field_index']
     if idx >= len(fields):
-        # Все поля заполнены, переходим к вопросу о форс-мажоре
-        await ask_force_majeure(message, state)
+        # Все поля заполнены, переходим к вопросу об аварии
+        await ask_accident(message, state)
         return
     field = fields[idx]
     text = f"<b>{field.label}</b>" + (" (обязательное)" if field.required else "")
-    # Если это поле "drilled_m", показываем текущую глубину
     if field.key == 'drilled_m':
         current = data.get('current_depth')
         if current is not None:
@@ -656,33 +659,174 @@ async def handle_field_callback(callback: CallbackQuery, state: FSMContext) -> N
     await ask_next_field(callback.message, state)
 
 
-async def ask_force_majeure(message: Message, state: FSMContext):
+# --------------------- Обработка аварий ---------------------
+async def ask_accident(message: Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚠️ Был форс-мажор", callback_data="fm_yes"),
-         InlineKeyboardButton(text="✅ Не было", callback_data="fm_no")]
+        [InlineKeyboardButton(text="⚠️ Была авария", callback_data="accident_yes"),
+         InlineKeyboardButton(text="✅ Не было", callback_data="accident_no")]
     ])
-    await message.answer("Был ли форс-мажор на этапе?", reply_markup=kb)
-    await state.set_state(ReportStates.asking_force_majeure)
+    await message.answer("Была ли аварийная ситуация на этапе?", reply_markup=kb)
+    await state.set_state(ReportStates.asking_accident)
 
 
-async def process_force_majeure(callback: CallbackQuery, state: FSMContext) -> None:
-    fm = (callback.data == "fm_yes")
+async def process_accident(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    stage = data.get('selected_stage')
+    if callback.data == "accident_no":
+        # Аварии нет – переходим к подтверждению (без аварии)
+        await show_summary_and_confirm(callback.message, state, callback.from_user.id, callback.from_user.full_name or "", accident_data=None)
+        await callback.message.delete()
+        return
+    elif callback.data == "accident_yes":
+        # Авария есть – спрашиваем тип в зависимости от этапа
+        if stage == WellStage.DRILLING:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔧 Устраняется", callback_data="accident_drilling_repairable")],
+                [InlineKeyboardButton(text="❌ Неустранимо, закрыть скважину", callback_data="accident_drilling_fatal")]
+            ])
+            await callback.message.edit_text("Авария при бурении. Что делать?", reply_markup=kb)
+            await state.set_state(ReportStates.accident_handling)
+        elif stage == WellStage.PUMPING:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔧 Техническая (обнулить время)", callback_data="accident_pumping_technical")],
+                [InlineKeyboardButton(text="✅ Результативная (досрочное завершение)", callback_data="accident_pumping_successful")]
+            ])
+            await callback.message.edit_text("Тип аварии при ОФР:", reply_markup=kb)
+            await state.set_state(ReportStates.accident_handling)
+        elif stage == WellStage.MODE:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔧 Устраняется", callback_data="accident_mode_repairable")],
+                [InlineKeyboardButton(text="❌ Неустранимо, закрыть скважину", callback_data="accident_mode_fatal")]
+            ])
+            await callback.message.edit_text("Авария на режиме. Что делать?", reply_markup=kb)
+            await state.set_state(ReportStates.accident_handling)
+        elif stage == WellStage.LIQUIDATION:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Закрыть скважину", callback_data="accident_liquidation_fatal")]
+            ])
+            await callback.message.edit_text("Авария при ликвидации. Закрыть скважину?", reply_markup=kb)
+            await state.set_state(ReportStates.accident_handling)
+
+
+async def handle_accident_decision(callback: CallbackQuery, state: FSMContext) -> None:
+    """Обрабатывает решение по аварии и сразу переходит к подтверждению."""
+    data = await state.get_data()
+    stage = data.get('selected_stage')
+    accident_type = callback.data  # например, accident_drilling_repairable
+
+    # Формируем структуру с информацией об аварии
+    accident_data = {'occurred': True, 'type': accident_type.split('_')[2]}  # repairable, fatal, technical, successful
+
+    # Если авария неустранимая – нужно будет потом закрыть скважину
+    # Пока просто сохраняем в состоянии
+    await state.update_data(accident_data=accident_data)
+
+    # Переходим к подтверждению сводки (с учётом аварии)
+    await show_summary_and_confirm(callback.message, state, callback.from_user.id, callback.from_user.full_name or "", accident_data)
+    await callback.message.delete()
+
+
+# --------------------- Подтверждение отправки ---------------------
+async def show_summary_and_confirm(message: Message, state: FSMContext, user_id: int, full_name: str, accident_data=None):
     data = await state.get_data()
     well_id = data['selected_well_id']
     answers = data.get('answers', {})
     fields = data.get('form_fields', [])
-    stage = data.get('selected_stage')
-    well = await sync_to_async(Well.objects.select_related('object__chat').get)(id=well_id)
-    user = await sync_to_async(TgUser.objects.get)(tg_user_id=callback.from_user.id)
+    stage = data['selected_stage']
+    well = await sync_to_async(Well.objects.get)(id=well_id)
+    user = await get_or_create_user(user_id, full_name)
     report_date = timezone.localdate()
 
-    if fm:
-        # Запоминаем предыдущий этап
-        well.previous_stage = well.stage
-        well.stage = WellStage.FORCE_MAJEURE
-        await sync_to_async(well.save)(update_fields=['stage', 'previous_stage'])
+    text = compose_report_text(report_date, user.full_name or str(user.tg_user_id), well.name, answers, fields, accident_data)
 
-    text = compose_report_text(report_date, user.full_name or str(user.tg_user_id), well.name, answers, fields, force_majeure=fm)
+    await state.update_data(preview_text=text, accident_data=accident_data)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить", callback_data="confirm_send"),
+         InlineKeyboardButton(text="❌ Отмена", callback_data="confirm_cancel")]
+    ])
+    await message.answer(f"Проверьте сводку:\n\n{text}\n\nОтправить?", reply_markup=kb)
+    await state.set_state(ReportStates.confirm_send)
+
+
+async def process_confirm_send(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.data == "confirm_send":
+        # Сохраняем отчёт (уже отправляет основное сообщение в чат)
+        await save_report(callback, state)
+        # Переходим к отправке файлов
+        await ask_files(callback.message, state)
+    else:
+        await callback.message.edit_text("Действие отменено.")
+        await state.clear()
+
+
+async def ask_files(message: Message, state: FSMContext):
+    """Предлагает отправить файлы к сводке."""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Готово, файлов больше нет", callback_data="files_done")],
+        [InlineKeyboardButton(text="⏭ Пропустить", callback_data="files_skip")]
+    ])
+    await message.answer(
+        "Теперь вы можете прикрепить файлы (фото, документы) к этой сводке.\n"
+        "Просто отправляйте их по одному. Когда закончите, нажмите кнопку.",
+        reply_markup=kb
+    )
+    await state.set_state(ReportStates.sending_files)
+
+
+async def handle_file(message: Message, state: FSMContext, bot: Bot):
+    """Пересылает полученный файл в чат объекта."""
+    data = await state.get_data()
+    well_id = data.get('selected_well_id')
+    if not well_id:
+        await message.answer("Ошибка: не найден объект. Начните заново.")
+        await state.clear()
+        return
+
+    well = await sync_to_async(Well.objects.select_related('object__chat').get)(id=well_id)
+    if not well.object.chat:
+        await message.answer("У объекта не привязан чат, файл некуда отправить.")
+        return
+
+    # Пересылаем файл в чат объекта
+    try:
+        if message.document:
+            await bot.send_document(chat_id=well.object.chat.chat_id, document=message.document.file_id, caption=f"📎 Файл к сводке от {timezone.localdate()}")
+        elif message.photo:
+            # Берём самое большое фото
+            await bot.send_photo(chat_id=well.object.chat.chat_id, photo=message.photo[-1].file_id, caption=f"📎 Фото к сводке от {timezone.localdate()}")
+        else:
+            await message.answer("Пожалуйста, отправьте документ или фото.")
+            return
+        await message.answer("✅ Файл отправлен.")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке файла: {e}")
+        await message.answer("❌ Не удалось отправить файл.")
+
+
+async def process_files_done(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("✅ Все файлы отправлены. Сводка полностью готова.")
+    await state.clear()
+
+
+async def process_files_skip(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("✅ Отправка завершена.")
+    await state.clear()
+
+
+# --------------------- Сохранение отчёта и логика этапов ---------------------
+async def save_report(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    well_id = data['selected_well_id']
+    answers = data.get('answers', {})
+    fields = data.get('form_fields', [])
+    stage = data['selected_stage']
+    accident_data = data.get('accident_data')
+    preview_text = data.get('preview_text')
+
+    well = await sync_to_async(Well.objects.select_related('object__chat').get)(id=well_id)
+    user = await get_or_create_user(callback.from_user.id, callback.from_user.full_name or "")
+    report_date = timezone.localdate()
 
     report = await sync_to_async(Report.objects.create)(
         object=well.object,
@@ -690,13 +834,14 @@ async def process_force_majeure(callback: CallbackQuery, state: FSMContext) -> N
         author=user,
         payload_json=answers,
         report_date=report_date,
-        message_text=text,
-        stage=stage
+        message_text=preview_text,
+        stage=stage,
     )
 
+    # Отправляем основное сообщение в чат объекта
     if well.object.chat:
         try:
-            sent = await callback.bot.send_message(chat_id=well.object.chat.chat_id, text=text)
+            sent = await callback.bot.send_message(chat_id=well.object.chat.chat_id, text=preview_text)
             report.tg_chat_id = sent.chat.id
             report.tg_message_id = sent.message_id
             await sync_to_async(report.save)(update_fields=['tg_chat_id', 'tg_message_id'])
@@ -706,94 +851,79 @@ async def process_force_majeure(callback: CallbackQuery, state: FSMContext) -> N
     else:
         await callback.message.answer("⚠️ У объекта не привязан чат.")
 
-    if fm:
-        await callback.message.edit_text("✅ Отчёт отправлен. Скважина заморожена из-за форс-мажора.")
-        await state.clear()
+    # Если авария была неустранимой (fatal) – закрываем скважину
+    if accident_data and accident_data.get('type') in ('fatal',):
+        well.status = WellStatus.CLOSED
+        well.closed_at = timezone.now()
+        well.closed_reason = 'accident'
+        await sync_to_async(well.save)(update_fields=['status', 'closed_at', 'closed_reason'])
         return
 
-    # Если не форс-мажор, проверяем завершение этапа
+    # Обновляем накопленные данные и проверяем завершение этапа
     stage_completed = False
 
     if stage == WellStage.DRILLING:
         drilled = answers.get('drilled_m')
         if drilled is not None:
             well.current_depth_m = drilled
-            await sync_to_async(well.save)(update_fields=['current_depth_m'])
-            if well.planned_depth_m and drilled >= well.planned_depth_m:
-                stage_completed = True
+        pumped = answers.get('pumping_hours_drilling')
+        if pumped:
+            well.total_drilling_pumping_hours += pumped
+        await sync_to_async(well.save)(update_fields=['current_depth_m', 'total_drilling_pumping_hours'])
+
+        if well.planned_depth_m and well.current_depth_m and well.current_depth_m >= well.planned_depth_m:
+            stage_completed = True
+
     elif stage == WellStage.PUMPING:
         pumped = answers.get('pumping_hours')
+        discharged = answers.get('discharge_hours')
         if pumped:
             well.total_pumping_hours += pumped
-            await sync_to_async(well.save)(update_fields=['total_pumping_hours'])
-            if well.planned_pumping_hours and well.total_pumping_hours >= well.planned_pumping_hours:
-                stage_completed = True
-    elif stage == WellStage.MAINTENANCE:
-        if answers.get('maintenance_completed') is True:
+        if discharged:
+            well.total_discharge_hours += discharged
+        await sync_to_async(well.save)(update_fields=['total_pumping_hours', 'total_discharge_hours'])
+        if well.planned_pumping_hours and well.total_discharge_hours >= well.planned_pumping_hours:
             stage_completed = True
+
+    elif stage == WellStage.MODE:
+        if well.remaining_mode_count > 0:
+            well.remaining_mode_count -= 1
+            await sync_to_async(well.save)(update_fields=['remaining_mode_count'])
+            if well.remaining_mode_count == 0:
+                stage_completed = True
+
     elif stage == WellStage.LIQUIDATION:
         if answers.get('liquidation_completed') is True:
             stage_completed = True
 
+    if accident_data and accident_data.get('type') == 'successful':
+        stage_completed = True
+
     if stage_completed:
-        # Определяем следующий этап в зависимости от текущего и флага сопровождения
+        next_stage = None
         if stage == WellStage.DRILLING:
-            next_stage = WellStage.PUMPING
+            if well.planned_pumping_hours and well.planned_pumping_hours > 0:
+                next_stage = WellStage.PUMPING
+            elif well.planned_mode_count > 0:
+                well.remaining_mode_count = well.planned_mode_count - 1
+                await sync_to_async(well.save)(update_fields=['remaining_mode_count'])
+                next_stage = WellStage.MODE
+            else:
+                next_stage = WellStage.LIQUIDATION
         elif stage == WellStage.PUMPING:
-            # После ОФР: если требуется сопровождение, идём на него, иначе сразу на завершено
-            next_stage = WellStage.MAINTENANCE if well.maintenance_needed else WellStage.COMPLETED
-        elif stage == WellStage.MAINTENANCE:
+            if well.planned_mode_count > 0:
+                well.remaining_mode_count = well.planned_mode_count - 1
+                await sync_to_async(well.save)(update_fields=['remaining_mode_count'])
+                next_stage = WellStage.MODE
+            else:
+                next_stage = WellStage.LIQUIDATION
+        elif stage == WellStage.MODE:
             next_stage = WellStage.LIQUIDATION
         elif stage == WellStage.LIQUIDATION:
             next_stage = WellStage.COMPLETED
-        else:
-            next_stage = None
 
         if next_stage:
             await transition_well_stage(well, next_stage, bot=callback.bot)
-            await callback.message.edit_text(f"✅ Отчёт отправлен. Этап завершён, скважина переведена на этап {WellStage(next_stage).label}.")
-        else:
-            await callback.message.edit_text("✅ Отчёт отправлен. Этап завершён.")
-    else:
-        await callback.message.edit_text("✅ Отчёт отправлен.")
-
-    await state.clear()
-
-
-# --------------------- Разморозка скважины (админ) ---------------------
-async def cmd_unfreeze(message: Message, state: FSMContext) -> None:
-    if not await check_user_role(message, [TgRole.ADMIN, TgRole.DEVELOPER]):
-        return
-    frozen_wells = await sync_to_async(list)(Well.objects.filter(
-        stage=WellStage.FORCE_MAJEURE,
-        status=WellStatus.ACTIVE
-    ).select_related('object'))
-    if not frozen_wells:
-        await message.answer("Нет замороженных скважин.")
-        return
-    await state.update_data(frozen_wells=frozen_wells)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{w.object.name} / {w.name}", callback_data=f"unfreeze_{w.id}")]
-        for w in frozen_wells
-    ])
-    await message.answer("Выберите скважину для разморозки:", reply_markup=kb)
-    await state.set_state(UnfreezeStates.choosing_well)
-
-
-async def process_unfreeze_well(callback: CallbackQuery, state: FSMContext) -> None:
-    well_id = int(callback.data.split("_")[1])
-    well = await sync_to_async(Well.objects.get)(id=well_id)
-    if well.stage != WellStage.FORCE_MAJEURE:
-        await callback.message.edit_text("Эта скважина уже не заморожена.")
-        await state.clear()
-        return
-    # Возвращаем предыдущий этап
-    previous = well.previous_stage or WellStage.DRILLING
-    well.stage = previous
-    well.previous_stage = None
-    await sync_to_async(well.save)(update_fields=['stage', 'previous_stage'])
-    await callback.message.edit_text(f"✅ Скважина {well.name} разморожена и возвращена на этап {WellStage(previous).label}.")
-    await state.clear()
 
 
 # --------------------- Обработка решений по закрытию скважин (админы) ---------------------
@@ -868,10 +998,8 @@ async def on_my_chat_member(update: ChatMemberUpdated) -> None:
     chat = update.chat
     if chat.type not in ('group', 'supergroup'):
         return
-
     new_status = update.new_chat_member.status
     is_active = new_status in ('member', 'administrator')
-
     await upsert_known_chat(
         chat_id=chat.id,
         title=chat.title,
@@ -881,12 +1009,10 @@ async def on_my_chat_member(update: ChatMemberUpdated) -> None:
 
 
 async def noop_message(message: Message) -> None:
-    """Глушим любые сообщения не из ЛС, чтобы не было 'Update ... is not handled'."""
     return
 
 
 async def noop_callback(callback: CallbackQuery) -> None:
-    """Глушим любые callback не из ЛС, чтобы не было 'Update ... is not handled'."""
     try:
         await callback.answer()
     except Exception:
@@ -911,111 +1037,51 @@ class Command(BaseCommand):
         )
         dp = Dispatcher(storage=MemoryStorage())
 
-        # ------------------------------------------------------------
-        # 1) Глобальные фильтры: ВСЁ общение с ботом - только в ЛС
-        # ------------------------------------------------------------
+        # Глобальные фильтры: только ЛС
         dp.message.filter(F.chat.type == "private")
         dp.callback_query.filter(F.message.chat.type == "private")
 
-        # ------------------------------------------------------------
-        # 2) Регистрируем хендлеры ЛС (без повторения F.chat.type)
-        # ------------------------------------------------------------
-         # Выбор типа отчёта
+        # Регистрация хендлеров
         dp.callback_query.register(process_report_type, ReportStates.choosing_report_type, F.data.in_(['report_type_work', 'report_type_temp']))
-
-        # Обработка выбора объекта для температуры
         dp.callback_query.register(process_temp_object, ReportStates.choosing_object, F.data.startswith("temp_obj_"))
-
-        # Ввод температуры
         dp.message.register(handle_temperature, ReportStates.waiting_temperature)
 
-        # Общие команды (ЛС)
         dp.message.register(cmd_start, CommandStart())
         dp.message.register(cmd_help, AiogramCommand('help'))
         dp.message.register(cmd_cancel, AiogramCommand('cancel'))
 
-        # Создание объекта (админ) — ЛС
         dp.message.register(cmd_create_object, AiogramCommand('create_object'))
         dp.message.register(process_object_name, CreateObjectStates.waiting_for_name)
 
-        dp.callback_query.register(
-            process_object_type,
-            CreateObjectStates.waiting_for_type,
-            F.data.in_(['private', 'federal'])
-        )
-
-        dp.callback_query.register(
-            process_chat_choice,
-            CreateObjectStates.waiting_for_chat,
-            F.data.startswith(('chat_', 'skip_chat'))
-        )
-
-        dp.message.register(
-            finish_wells,
-            CreateObjectStates.waiting_for_wells,
-            AiogramCommand('done')
-        )
+        dp.callback_query.register(process_chat_choice, CreateObjectStates.waiting_for_chat, F.data.startswith(('chat_', 'skip_chat')))
+        dp.message.register(finish_wells, CreateObjectStates.waiting_for_wells, AiogramCommand('done'))
         dp.message.register(process_well, CreateObjectStates.waiting_for_wells)
 
-        # Отчёт — ЛС
         dp.message.register(cmd_report, AiogramCommand('report'))
-
-        dp.callback_query.register(
-            process_report_object,
-            ReportStates.choosing_object,
-            F.data.startswith("rep_obj_")
-        )
-        dp.callback_query.register(
-            process_report_stage,
-            ReportStates.choosing_stage,
-            F.data.startswith("rep_stage_")
-        )
-        dp.callback_query.register(
-            process_report_well,
-            ReportStates.choosing_well,
-            F.data.startswith("rep_well_")
-        )
+        dp.callback_query.register(process_report_object, ReportStates.choosing_object, F.data.startswith("rep_obj_"))
+        dp.callback_query.register(process_report_stage, ReportStates.choosing_stage, F.data.startswith("rep_stage_"))
+        dp.callback_query.register(process_report_well, ReportStates.choosing_well, F.data.startswith("rep_well_"))
 
         dp.message.register(handle_field_text, ReportStates.entering_fields)
+        dp.callback_query.register(handle_field_callback, ReportStates.entering_fields, F.data.startswith("fld:"))
 
-        dp.callback_query.register(
-            handle_field_callback,
-            ReportStates.entering_fields,
-            F.data.startswith("fld:")
-        )
+        # Аварии и подтверждение
+        dp.callback_query.register(process_accident, ReportStates.asking_accident, F.data.in_(['accident_yes', 'accident_no']))
+        dp.callback_query.register(handle_accident_decision, ReportStates.accident_handling, F.data.startswith(('accident_drilling_', 'accident_pumping_', 'accident_mode_', 'accident_liquidation_')))
+        dp.callback_query.register(process_confirm_send, ReportStates.confirm_send, F.data.in_(['confirm_send', 'confirm_cancel']))
 
-        dp.callback_query.register(
-            process_force_majeure,
-            ReportStates.asking_force_majeure,
-            F.data.in_(['fm_yes', 'fm_no'])
-        )
+        # Обработка файлов после отправки сводки
+        dp.message.register(handle_file, ReportStates.sending_files, F.content_type.in_(['document', 'photo']))
+        dp.callback_query.register(process_files_done, ReportStates.sending_files, F.data == "files_done")
+        dp.callback_query.register(process_files_skip, ReportStates.sending_files, F.data == "files_skip")
 
-        # Разморозка — ЛС
-        dp.message.register(cmd_unfreeze, AiogramCommand('unfreeze'))
+        # Запросы закрытия (если нужны)
+        dp.callback_query.register(close_request_callback, F.data.startswith("cl_"))
 
-        dp.callback_query.register(
-            process_unfreeze_well,
-            UnfreezeStates.choosing_well,
-            F.data.startswith("unfreeze_")
-        )
-
-        # Запросы закрытия (уведомления админам приходят в ЛС) — ЛС
-        dp.callback_query.register(
-            close_request_callback,
-            F.data.startswith("cl_")
-        )
-
-        # ------------------------------------------------------------
-        # 3) Групповые события/апдейты
-        # ------------------------------------------------------------
-
-        # Изменение членства бота (в группах) — НЕ попадает под dp.message.filter
+        # Изменение членства
         dp.my_chat_member.register(on_my_chat_member)
 
-        # ------------------------------------------------------------
-        # 4) "Глушилки" для НЕ-private апдейтов
-        #    Чтобы не было "Update ... is not handled"
-        # ------------------------------------------------------------
+        # Глушилки
         dp.message.register(noop_message, ~F.chat.type.in_({"private"}))
         dp.callback_query.register(noop_callback, F.message.chat.type != "private")
 
@@ -1027,4 +1093,4 @@ class Command(BaseCommand):
                 allowed_updates=['message', 'callback_query', 'my_chat_member']
             )
         finally:
-            await bot.session.close()   
+            await bot.session.close()

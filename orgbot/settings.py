@@ -59,7 +59,6 @@ DATABASES = {
     }
 }
 
-# Простая модель пользователя – оставляем стандартную, будем использовать свою TgUser
 AUTH_PASSWORD_VALIDATORS = []
 
 LANGUAGE_CODE = 'ru-ru'
@@ -68,7 +67,7 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = 'static/'
-STATICFILES_DIRS = [BASE_DIR / 'static']  # создадим позже, если понадобится
+STATICFILES_DIRS = [BASE_DIR / 'static'] 
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
