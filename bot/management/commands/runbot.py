@@ -103,13 +103,22 @@ async def check_user_role(message: Message, allowed_roles: list) -> bool:
         return False
 
 
+# @sync_to_async
+# def get_active_objects():
+#     from django.db.models import Exists, OuterRef
+#     active_wells = Well.objects.filter(object=OuterRef('pk'), status=WellStatus.ACTIVE)
+#     return list(OrgObject.objects.filter(status=ObjectStatus.ACTIVE).annotate(
+#         has_active_wells=Exists(active_wells)
+#     ).filter(has_active_wells=True).order_by('name'))
 @sync_to_async
 def get_active_objects():
     from django.db.models import Exists, OuterRef
     active_wells = Well.objects.filter(object=OuterRef('pk'), status=WellStatus.ACTIVE)
-    return list(OrgObject.objects.filter(status=ObjectStatus.ACTIVE).annotate(
-        has_active_wells=Exists(active_wells)
-    ).filter(has_active_wells=True).order_by('name'))
+    return list(OrgObject.objects.filter(status=ObjectStatus.ACTIVE)
+                .annotate(has_active_wells=Exists(active_wells))
+                .filter(has_active_wells=True)
+                .select_related('chat')   # добавляем предзагрузку чата
+                .order_by('name'))
 
 
 @sync_to_async
@@ -140,10 +149,11 @@ def get_form_fields(form_code: str):
         return []
 
 
-def compose_report_text(report_date, author_name, well_name, answers, fields, accident_data=None):
+def compose_report_text(report_date, author_name, well_name, stage, answers, fields, accident_data=None):
     lines = []
     lines.append(f"{report_date.strftime('%d.%m.%Y')} — {author_name}")
     lines.append(f"Скважина: {well_name}")
+    lines.append(f"Этап: {WellStage(stage).label}")
 
     if accident_data and accident_data.get('occurred'):
         if accident_data['type'] == 'repairable':
@@ -404,10 +414,29 @@ async def process_report_type(callback: CallbackQuery, state: FSMContext) -> Non
             await callback.message.edit_text("Нет доступных объектов для отчёта.")
             await state.clear()
             return
-        await state.update_data(objects_list=objects)
+
+        user_role = await get_user_role(callback.from_user.id)
+        if user_role in [TgRole.ADMIN, TgRole.DEVELOPER]:
+            filtered_objects = objects
+        else:
+            filtered_objects = []
+            cache = {}
+            for obj in objects:
+                if obj.chat:
+                    chat_id = obj.chat.chat_id
+                    if chat_id not in cache:
+                        cache[chat_id] = await is_user_in_chat(callback.bot, callback.from_user.id, chat_id)
+                    if cache[chat_id]:
+                        filtered_objects.append(obj)
+            if not filtered_objects:
+                await callback.message.edit_text("У вас нет доступа ни к одному объекту.")
+                await state.clear()
+                return
+
+        await state.update_data(objects_list=filtered_objects)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=obj.name, callback_data=f"rep_obj_{obj.id}")]
-            for obj in objects
+            for obj in filtered_objects
         ])
         await callback.message.edit_text("Выберите объект:", reply_markup=kb)
         await state.set_state(ReportStates.choosing_object)
@@ -417,10 +446,24 @@ async def process_report_type(callback: CallbackQuery, state: FSMContext) -> Non
             await callback.message.edit_text("Нет доступных объектов для отчёта.")
             await state.clear()
             return
-        await state.update_data(objects_list=objects)
+
+        user_role = await get_user_role(callback.from_user.id)
+        if user_role in [TgRole.ADMIN, TgRole.DEVELOPER]:
+            filtered_objects = objects
+        else:
+            filtered_objects = []
+            for obj in objects:
+                if obj.chat and await is_user_in_chat(callback.bot, callback.from_user.id, obj.chat.chat_id):
+                    filtered_objects.append(obj)
+            if not filtered_objects:
+                await callback.message.edit_text("У вас нет доступа ни к одному объекту.")
+                await state.clear()
+                return
+
+        await state.update_data(objects_list=filtered_objects)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=obj.name, callback_data=f"temp_obj_{obj.id}")]
-            for obj in objects
+            for obj in filtered_objects
         ])
         await callback.message.edit_text("Выберите объект для температурной сводки:", reply_markup=kb)
         await state.set_state(ReportStates.choosing_object)
@@ -737,7 +780,7 @@ async def show_summary_and_confirm(message: Message, state: FSMContext, user_id:
     user = await get_or_create_user(user_id, full_name)
     report_date = timezone.localdate()
 
-    text = compose_report_text(report_date, user.full_name or str(user.tg_user_id), well.name, answers, fields, accident_data)
+    text = compose_report_text(report_date, user.full_name or str(user.tg_user_id), well.name, stage, answers, fields, accident_data)
 
     await state.update_data(preview_text=text, accident_data=accident_data)
 
@@ -874,14 +917,21 @@ async def save_report(callback: CallbackQuery, state: FSMContext):
         if well.planned_depth_m and well.current_depth_m and well.current_depth_m >= well.planned_depth_m:
             stage_completed = True
 
+    # elif stage == WellStage.PUMPING:
+    #     pumped = answers.get('pumping_hours')
+    #     discharged = answers.get('discharge_hours')
+    #     if pumped:
+    #         well.total_pumping_hours += pumped
+    #     if discharged:
+    #         well.total_discharge_hours += discharged
+    #     await sync_to_async(well.save)(update_fields=['total_pumping_hours', 'total_discharge_hours'])
+    #     if well.planned_pumping_hours and well.total_discharge_hours >= well.planned_pumping_hours:
+    #         stage_completed = True
     elif stage == WellStage.PUMPING:
-        pumped = answers.get('pumping_hours')
         discharged = answers.get('discharge_hours')
-        if pumped:
-            well.total_pumping_hours += pumped
         if discharged:
             well.total_discharge_hours += discharged
-        await sync_to_async(well.save)(update_fields=['total_pumping_hours', 'total_discharge_hours'])
+        await sync_to_async(well.save)(update_fields=['total_discharge_hours'])
         if well.planned_pumping_hours and well.total_discharge_hours >= well.planned_pumping_hours:
             stage_completed = True
 
@@ -1018,6 +1068,12 @@ async def noop_callback(callback: CallbackQuery) -> None:
     except Exception:
         pass
 
+async def is_user_in_chat(bot: Bot, user_id: int, chat_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ['member', 'administrator', 'creator']
+    except Exception:
+        return False
 
 class Command(BaseCommand):
     help = 'Запуск Telegram бота (aiogram)'
